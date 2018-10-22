@@ -1,23 +1,20 @@
 # coding=utf-8
+import os
 import time
 
 import cv2
 import numpy as np
-import os
 import tensorflow as tf
-from tensorflow.contrib import slim
 
-# the encoder basenet,vgg16 and vgg19 use .npy file else use tf.slim
-import vgg16
-import vgg19
-from image_reader import ImageReader
-from nets import inception, resnet_v2
+import nets.encoder_factory as encoder_factory
+from preprocessing.image_reader import ImageReader
+from utils.utils import make_dir
 
 # 只使用一个gpu
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
-LATENT_DIM = 800  # 跟sift+color保持一致
+LATENT_DIM = 4096  # 跟sift+color保持一致:800
 # HEIGHT, WIDTH, DEPTH = 144, 112, 3
 # H1, W1, D1, D2, D3, D4 = 9, 7, 16, 32, 64, 128 #for original vae
 HEIGHT, WIDTH, DEPTH = 224, 224, 3
@@ -27,15 +24,62 @@ BATCH_SIZE, LEARNING_RATE, TRAIN_ITERS = 32, 1e-4, 1000000
 EVAL_ROWS, EVAL_COLS, SAMPLES_PATH, EVAL_INTERVAL = 4, 4, './samples_vae_resnetv2_101', 1000
 MODEL_PATH, SAVE_INTERVAL = './model_vae_resnetv2_101', 1000
 
-is_scale = True
-is_mirror = True
-is_crop = False  # 是否随机crop
-is_shuffle = True
+IS_SCALE = True
+IS_MIRROR = True
+IS_CROP = False  # 是否随机crop
+IS_SHUFFLE = True
+
+# TODO this parameter how to set?
+PARAMATER_KL_RATE = -0.5
 
 
-# -------------------------------------------------------------
-# -------------------------- encoder --------------------------
-# -------------------------------------------------------------
+def valid_the_input(i, lab_batch_r_f, train_data_, input_h, input_w, input_c):
+    # 验证输入文件的正确性
+    data = np.reshape((train_data_ * 255).astype(int), (20, 20, input_h, input_w, input_c))
+    data = np.concatenate(np.concatenate(data, 1), 1)
+    cv2.imwrite(SAMPLES_PATH + '/iter-x-ori-%d.png' % i, data[:, :, ::-1])
+    data = np.reshape((lab_batch_r_f * 255).astype(int), (20, 20, input_h, input_w, input_c))
+    data = np.concatenate(np.concatenate(data, 1), 1)
+    cv2.imwrite(SAMPLES_PATH + '/iter-x-label-%d.png' % i, data[:, :, ::-1])
+
+
+def assign_decay(orig_val, new_val, momentum, name):
+    with tf.name_scope(name):
+        scaled_diff = (1 - momentum) * (new_val - orig_val)
+
+    return tf.assign_add(orig_val, scaled_diff)
+
+
+def batch_norm(x, train_logical, decay, epsilon, scope=None, shift=True, scale=False):
+    channels = x.get_shape()[-1]
+    ndim = len(x.shape)
+
+    with tf.variable_scope(scope):
+
+        moving_m = tf.get_variable('mean', [channels], initializer=tf.zeros_initializer, trainable=False)
+        moving_v = tf.get_variable('var', [channels], initializer=tf.ones_initializer, trainable=False)
+
+        if train_logical == True:
+
+            m, v = tf.nn.moments(x, range(ndim - 1))
+            update_m = assign_decay(moving_m, m, decay, 'update_mean')
+            update_v = assign_decay(moving_v, v, decay, 'update_var')
+
+            with tf.control_dependencies([update_m, update_v]):
+                output = (x - m) * tf.rsqrt(v + epsilon)
+
+        else:
+            m, v = moving_m, moving_v
+            output = (x - m) * tf.rsqrt(v + epsilon)
+
+        if scale:
+            output *= tf.get_variable('gamma', [channels], initializer=tf.ones_initializer)
+
+        if shift:
+            output += tf.get_variable('beta', [channels], initializer=tf.zeros_initializer)
+
+    return output
+
 
 def lrelu(x, leak, name):
     return tf.maximum(x, leak * x, name=name)
@@ -68,324 +112,26 @@ def fc_block(input, in_num, out_num, w_initializer, b_initializer, scope):
         w = tf.get_variable('w', [in_num, out_num], dtype=tf.float32, initializer=w_initializer)
         b = tf.get_variable('b', [out_num], dtype=tf.float32, initializer=b_initializer)
 
+        variable_summaries(w, scope)
+        variable_summaries(b, scope)
+
         fc = tf.matmul(input, w, name='matmul')
         fc = tf.add(fc, b, name='add')
 
     return fc
 
 
-def encoder(input, train_logical, latent_dim):
-    xavier_initializer_conv = tf.contrib.layers.xavier_initializer_conv2d()
-    xavier_initializer_fc = tf.contrib.layers.xavier_initializer()
-    zeros_initializer = tf.zeros_initializer()
-
-    act1 = conv_block(input, D1, train_logical, xavier_initializer_conv, zeros_initializer, 'conv1')
-    act2 = conv_block(act1, D2, train_logical, xavier_initializer_conv, zeros_initializer, 'conv2')
-    act3 = conv_block(act2, D3, train_logical, xavier_initializer_conv, zeros_initializer, 'conv3')
-    act4 = conv_block(act3, D4, train_logical, xavier_initializer_conv, zeros_initializer, 'conv4')
-
-    act4_num = int(np.prod(act4.get_shape()[1:]))
-    act4_flat = tf.reshape(act4, [-1, act4_num])
-
-    mean = fc_block(act4_flat, act4_num, latent_dim, xavier_initializer_fc, zeros_initializer, 'mean')
-    stddev = fc_block(act4_flat, act4_num, latent_dim, xavier_initializer_fc, zeros_initializer, 'stddev')
-
-    return mean, stddev
-
-
-def encoder_vgg16(input, latent_dim):
-    vgg = vgg16.Vgg16()
-    with tf.name_scope("content_vgg"):
-        act4 = vgg.build_as_encoder(input)
-
-    xavier_initializer_fc = tf.contrib.layers.xavier_initializer()
-    zeros_initializer = tf.zeros_initializer()
-
-    act4_num = int(np.prod(act4.get_shape()[1:]))
-    act4_flat = tf.reshape(act4, [-1, act4_num])
-
-    mean = fc_block(act4_flat, act4_num, latent_dim, xavier_initializer_fc, zeros_initializer, 'mean')
-    stddev = fc_block(act4_flat, act4_num, latent_dim, xavier_initializer_fc, zeros_initializer, 'stddev')
-
-    return mean, stddev
-
-
-def encoder_vgg19(input, latent_dim):
-    vgg = vgg19.Vgg19()
-    with tf.name_scope("content_vgg"):
-        act4 = vgg.build_as_encoder(input)
-
-    xavier_initializer_fc = tf.contrib.layers.xavier_initializer()
-    zeros_initializer = tf.zeros_initializer()
-
-    act4_num = int(np.prod(act4.get_shape()[1:]))
-    act4_flat = tf.reshape(act4, [-1, act4_num])
-
-    mean = fc_block(act4_flat, act4_num, latent_dim, xavier_initializer_fc, zeros_initializer, 'mean')
-    stddev = fc_block(act4_flat, act4_num, latent_dim, xavier_initializer_fc, zeros_initializer, 'stddev')
-
-    return mean, stddev
-
-
-def encoder_inceptionv1(input, latent_dim):
-    with slim.arg_scope(inception.inception_v1_arg_scope()):
-        act4, _ = inception.inception_v1(input, num_classes=0, is_training=True)
-    xavier_initializer_fc = tf.contrib.layers.xavier_initializer()
-    zeros_initializer = tf.zeros_initializer()
-
-    act4_num = int(np.prod(act4.get_shape()[1:]))
-    act4_flat = tf.reshape(act4, [-1, act4_num])
-
-    mean = fc_block(act4_flat, act4_num, latent_dim, xavier_initializer_fc, zeros_initializer, 'mean')
-    stddev = fc_block(act4_flat, act4_num, latent_dim, xavier_initializer_fc, zeros_initializer, 'stddev')
-
-    return mean, stddev
-
-
-def encoder_inceptionv4(input, latent_dim):
-    with slim.arg_scope(inception.inception_v4_arg_scope()):
-        act4, _ = inception.inception_v4(input, num_classes=0, is_training=True)
-    xavier_initializer_fc = tf.contrib.layers.xavier_initializer()
-    zeros_initializer = tf.zeros_initializer()
-
-    act4_num = int(np.prod(act4.get_shape()[1:]))
-    act4_flat = tf.reshape(act4, [-1, act4_num])
-
-    mean = fc_block(act4_flat, act4_num, latent_dim, xavier_initializer_fc, zeros_initializer, 'mean')
-    stddev = fc_block(act4_flat, act4_num, latent_dim, xavier_initializer_fc, zeros_initializer, 'stddev')
-
-    return mean, stddev
-
-
-def encoder_inception_resnetv2(input, latent_dim):
-    with slim.arg_scope(inception.inception_v4_arg_scope()):
-        act4, _ = inception.inception_resnet_v2(input, num_classes=0, is_training=True)
-    xavier_initializer_fc = tf.contrib.layers.xavier_initializer()
-    zeros_initializer = tf.zeros_initializer()
-
-    act4_num = int(np.prod(act4.get_shape()[1:]))
-    act4_flat = tf.reshape(act4, [-1, act4_num])
-
-    mean = fc_block(act4_flat, act4_num, latent_dim, xavier_initializer_fc, zeros_initializer, 'mean')
-    stddev = fc_block(act4_flat, act4_num, latent_dim, xavier_initializer_fc, zeros_initializer, 'stddev')
-
-    return mean, stddev
-
-
-def encoder_resnetv2_152(input, latent_dim):
-    with slim.arg_scope(resnet_v2.resnet_arg_scope()):
-        act4, _ = resnet_v2.resnet_v2_152(input, num_classes=0, is_training=True)
-    xavier_initializer_fc = tf.contrib.layers.xavier_initializer()
-    zeros_initializer = tf.zeros_initializer()
-
-    act4_num = int(np.prod(act4.get_shape()[1:]))
-    act4_flat = tf.reshape(act4, [-1, act4_num])
-
-    mean = fc_block(act4_flat, act4_num, latent_dim, xavier_initializer_fc, zeros_initializer, 'mean')
-    stddev = fc_block(act4_flat, act4_num, latent_dim, xavier_initializer_fc, zeros_initializer, 'stddev')
-
-    return mean, stddev
-
-
-def encoder_resnetv2_101(input, latent_dim):
-    with slim.arg_scope(resnet_v2.resnet_arg_scope()):
-        act4, _ = resnet_v2.resnet_v2_101(input, num_classes=0, is_training=True)
-    xavier_initializer_fc = tf.contrib.layers.xavier_initializer()
-    zeros_initializer = tf.zeros_initializer()
-
-    act4_num = int(np.prod(act4.get_shape()[1:]))
-    act4_flat = tf.reshape(act4, [-1, act4_num])
-
-    mean = fc_block(act4_flat, act4_num, latent_dim, xavier_initializer_fc, zeros_initializer, 'mean')
-    stddev = fc_block(act4_flat, act4_num, latent_dim, xavier_initializer_fc, zeros_initializer, 'stddev')
-
-    return mean, stddev
-
-
-def get_init_fn_inceptonv1(sess, checkpoint_file):
-    '''
-    restore the bias and weights for the basenet of tf.slim
-    :param sess:
-    :param checkpoint_file:
-    :return:
-    '''
-    resotre_var_global = {}
-    for v in tf.global_variables():
-        if 'InceptionV1' in v.name:
-            resotre_var_global[v.name.split(':')[0]] = v
-    # print resotre_var_global.keys()
-    checkpoint_exclude_scopes = ["global_step", "InceptionV1/Logits", "InceptionV1/AuxLogits"]
-    exclusions = [scope.strip() for scope in checkpoint_exclude_scopes]
-
-    reader = tf.train.NewCheckpointReader(checkpoint_file)
-    name_shape_dict = reader.get_variable_to_shape_map()
-    names = name_shape_dict.keys()
-
-    variables_to_restore = []
-    for var in names:
-        for exclusion in exclusions:
-            if var.startswith(exclusion):
-                break
-        else:
-            variables_to_restore.append(var)
-
-    for index, name in enumerate(variables_to_restore):
-        try:
-            var = resotre_var_global[name]
-            sess.run(var.assign(reader.get_tensor(name)))
-        except:
-            print('can not restore var: ' + name)
-
-        print "{}/{}".format(index, len(variables_to_restore)), name, name_shape_dict[name]
-
-
-def get_init_fn_resnetv2_101(sess, checkpoint_file):
-    '''
-    restore the bias and weights for the basenet of tf.slim
-    :param sess:
-    :param checkpoint_file:
-    :return:
-    '''
-    resotre_var_global = {}
-    for v in tf.global_variables():
-        if 'resnet_v2_101' in v.name:
-            resotre_var_global[v.name.split(':')[0]] = v
-    # print resotre_var_global.keys()
-    checkpoint_exclude_scopes = ["global_step", "resnet_v2_101/Logits", "resnet_v2_101/AuxLogits"]
-    exclusions = [scope.strip() for scope in checkpoint_exclude_scopes]
-
-    reader = tf.train.NewCheckpointReader(checkpoint_file)
-    name_shape_dict = reader.get_variable_to_shape_map()
-    names = name_shape_dict.keys()
-
-    variables_to_restore = []
-    for var in names:
-        for exclusion in exclusions:
-            if var.startswith(exclusion):
-                break
-        else:
-            variables_to_restore.append(var)
-
-    for index, name in enumerate(variables_to_restore):
-        try:
-            var = resotre_var_global[name]
-            sess.run(var.assign(reader.get_tensor(name)))
-        except:
-            print('can not restore var: ' + name)
-
-        print "{}/{}".format(index, len(variables_to_restore)), name, name_shape_dict[name]
-
-
-def get_init_fn_resnetv2_152(sess, checkpoint_file):
-    '''
-    restore the bias and weights for the basenet of tf.slim
-    :param sess:
-    :param checkpoint_file:
-    :return:
-    '''
-    resotre_var_global = {}
-    for v in tf.global_variables():
-        if 'resnet_v2_152' in v.name:
-            resotre_var_global[v.name.split(':')[0]] = v
-    # print resotre_var_global.keys()
-    checkpoint_exclude_scopes = ["global_step", "resnet_v2_152/Logits", "resnet_v2_152/AuxLogits"]
-    exclusions = [scope.strip() for scope in checkpoint_exclude_scopes]
-
-    reader = tf.train.NewCheckpointReader(checkpoint_file)
-    name_shape_dict = reader.get_variable_to_shape_map()
-    names = name_shape_dict.keys()
-
-    variables_to_restore = []
-    for var in names:
-        for exclusion in exclusions:
-            if var.startswith(exclusion):
-                break
-        else:
-            variables_to_restore.append(var)
-
-    for index, name in enumerate(variables_to_restore):
-        try:
-            var = resotre_var_global[name]
-            sess.run(var.assign(reader.get_tensor(name)))
-        except:
-            print('can not restore var: ' + name)
-
-        print "{}/{}".format(index, len(variables_to_restore)), name, name_shape_dict[name]
-
-
-def get_init_fn_inceptonv4(sess, checkpoint_file):
-    '''
-    restore the bias and weights for the basenet of tf.slim
-    :param sess:
-    :param checkpoint_file:
-    :return:
-    '''
-    resotre_var_global = {}
-    for v in tf.global_variables():
-        if 'InceptionV4' in v.name:
-            resotre_var_global[v.name.split(':')[0]] = v
-    # print resotre_var_global.keys()
-    checkpoint_exclude_scopes = ["global_step", "InceptionV4/Logits", "InceptionV4/AuxLogits"]
-    exclusions = [scope.strip() for scope in checkpoint_exclude_scopes]
-
-    reader = tf.train.NewCheckpointReader(checkpoint_file)
-    name_shape_dict = reader.get_variable_to_shape_map()
-    names = name_shape_dict.keys()
-
-    variables_to_restore = []
-    for var in names:
-        for exclusion in exclusions:
-            if var.startswith(exclusion):
-                break
-        else:
-            variables_to_restore.append(var)
-
-    for index, name in enumerate(variables_to_restore):
-        try:
-            var = resotre_var_global[name]
-            sess.run(var.assign(reader.get_tensor(name)))
-        except:
-            print('can not restore var: ' + name)
-
-        print "{}/{}".format(index, len(variables_to_restore)), name, name_shape_dict[name]
-
-
-def get_init_fn_incepton_resnetv2(sess, checkpoint_file):
-    '''
-    restore the bias and weights for the basenet of tf.slim
-    :param sess:
-    :param checkpoint_file:
-    :return:
-    '''
-    resotre_var_global = {}
-    for v in tf.global_variables():
-        if 'InceptionResnetV2' in v.name:
-            resotre_var_global[v.name.split(':')[0]] = v
-    # print resotre_var_global.keys()
-    checkpoint_exclude_scopes = ["global_step", "InceptionResnetV2/Logits", "InceptionResnetV2/AuxLogits"]
-    exclusions = [scope.strip() for scope in checkpoint_exclude_scopes]
-
-    reader = tf.train.NewCheckpointReader(checkpoint_file)
-    name_shape_dict = reader.get_variable_to_shape_map()
-    names = name_shape_dict.keys()
-
-    variables_to_restore = []
-    for var in names:
-        for exclusion in exclusions:
-            if var.startswith(exclusion):
-                break
-        else:
-            variables_to_restore.append(var)
-
-    for index, name in enumerate(variables_to_restore):
-        try:
-            var = resotre_var_global[name]
-            sess.run(var.assign(reader.get_tensor(name)))
-        except:
-            print('can not restore var: ' + name)
-
-        print "{}/{}".format(index, len(variables_to_restore)), name, name_shape_dict[name]
-
+def variable_summaries(var, name):
+    """Attach a lot of summaries to a Tensor."""
+    with tf.name_scope('summaries'):
+        mean = tf.reduce_mean(var)
+        tf.summary.scalar('mean/' + name, mean)
+        with tf.name_scope('stddev'):
+            stddev = tf.sqrt(tf.reduce_mean(tf.square(var - mean)))
+        tf.summary.scalar('sttdev/' + name, stddev)
+        tf.summary.scalar('max/' + name, tf.reduce_max(var))
+        tf.summary.scalar('min/' + name, tf.reduce_min(var))
+        tf.summary.histogram(name, var)
 
 # -------------------------------------------------------------
 # -------------------------- decoder --------------------------
@@ -456,16 +202,6 @@ def decoder(input, train_logical):
 
 
 # -------------------------------------------------------------------
-# -------------------------- utils --------------------------
-# -------------------------------------------------------------------
-
-
-def make_dir(directory):
-    if not os.path.exists(directory):
-        os.makedirs(directory)
-
-
-# -------------------------------------------------------------------
 # -------------------------- record reader --------------------------
 # -------------------------------------------------------------------
 
@@ -481,61 +217,15 @@ def read_images_queue(data_list, batch_size, image_channels, label_channels, ima
     return img_name_batch, img_batch, label_batch, reader.data_list_len
 
 
-# -------------------------------------------------------------------------
-# -------------------------- batch normalization --------------------------
-# -------------------------------------------------------------------------
-
-def assign_decay(orig_val, new_val, momentum, name):
-    with tf.name_scope(name):
-        scaled_diff = (1 - momentum) * (new_val - orig_val)
-
-    return tf.assign_add(orig_val, scaled_diff)
-
-
-def batch_norm(x, train_logical, decay, epsilon, scope=None, shift=True, scale=False):
-    channels = x.get_shape()[-1]
-    ndim = len(x.shape)
-
-    with tf.variable_scope(scope):
-
-        moving_m = tf.get_variable('mean', [channels], initializer=tf.zeros_initializer, trainable=False)
-        moving_v = tf.get_variable('var', [channels], initializer=tf.ones_initializer, trainable=False)
-
-        if train_logical == True:
-
-            m, v = tf.nn.moments(x, range(ndim - 1))
-            update_m = assign_decay(moving_m, m, decay, 'update_mean')
-            update_v = assign_decay(moving_v, v, decay, 'update_var')
-
-            with tf.control_dependencies([update_m, update_v]):
-                output = (x - m) * tf.rsqrt(v + epsilon)
-
-        else:
-            m, v = moving_m, moving_v
-            output = (x - m) * tf.rsqrt(v + epsilon)
-
-        if scale:
-            output *= tf.get_variable('gamma', [channels], initializer=tf.ones_initializer)
-
-        if shift:
-            output += tf.get_variable('beta', [channels], initializer=tf.zeros_initializer)
-
-    return output
-
-
-# -------------------------------------------------------------------------
-# -------------------------------------------------------------------------
-# -------------------------------------------------------------------------
-
-
-
-
 # -------------------------------------------------------------
 # -------------------------- training --------------------------
 # --------------------------------------------------------------
 
 
 def train():
+    make_dir(MODEL_PATH)
+    make_dir(SAMPLES_PATH)
+
     with tf.name_scope('batch'):
         train_imgs_file = './data/image_list_train.txt'
         print 'the train imags txt is : ' + train_imgs_file
@@ -543,31 +233,44 @@ def train():
                                                                               image_channels=DEPTH,
                                                                               label_channels=DEPTH, image_h=HEIGHT,
                                                                               image_w=WIDTH,
-                                                                              is_scale=is_scale,
-                                                                              is_mirror=is_mirror,
-                                                                              is_crop=is_crop,
-                                                                              is_shuffle=is_shuffle,
+                                                                              is_scale=IS_SCALE,
+                                                                              is_mirror=IS_MIRROR,
+                                                                              is_crop=IS_CROP,
+                                                                              is_shuffle=IS_SHUFFLE,
                                                                               basenet='resnetv2_101')
 
     with tf.variable_scope('encoder'):
         x_input = tf.placeholder(tf.float32, shape=[None, HEIGHT, WIDTH, DEPTH], name='input_img')
         x = tf.placeholder(tf.float32, shape=[None, HEIGHT, WIDTH, DEPTH], name='target_img')
 
-        # latent_mean, latent_stddev = encoder(x_input, train_logical=True, latent_dim=LATENT_DIM)
+        # latent_mean, latent_stddev = encoder_factory.encoder(x_input, True, LATENT_DIM, D1, D2, D3, D4)
     # latent_mean, latent_stddev = encoder_vgg16(x_input, latent_dim=LATENT_DIM)
     # latent_mean, latent_stddev = encoder_vgg19(x_input, latent_dim=LATENT_DIM)
     # latent_mean, latent_stddev = encoder_inceptionv1(x_input, latent_dim=LATENT_DIM)
     # latent_mean, latent_stddev = encoder_inceptionv4(x_input, latent_dim=LATENT_DIM)
     # latent_mean, latent_stddev = encoder_inception_resnetv2(x_input, latent_dim=LATENT_DIM)
     # latent_mean, latent_stddev = encoder_resnetv2_152(x_input, latent_dim=LATENT_DIM)#参数过多，训练很慢
-    latent_mean, latent_stddev = encoder_resnetv2_101(x_input, latent_dim=LATENT_DIM)
+    latent_mean, latent_stddev = encoder_factory.encoder_resnetv2_101(x_input, latent_dim=LATENT_DIM)
+
+    # add input 10 images to the tensorboard
+    # with tf.name_scope('input_reshape'):
+    #     means = [123.68, 116.779, 103.939]
+    #     num_channels = x_input.get_shape().as_list()[-1]
+    #     if len(means) != num_channels:
+    #         raise ValueError('len(means) must match the number of channels')
+    #
+    #     channels = tf.split(axis=3, num_or_size_splits=num_channels, value=x_input)
+    #     for i in range(num_channels):
+    #         channels[i] += means[i]
+    #     image_shaped_input = tf.concat(axis=3, values=channels)
+    #     tf.summary.image('input', image_shaped_input, 10)
 
     with tf.variable_scope('variance'):
-        # with tf.name_scope('train'):
-        #     random_normal = tf.random_normal([BATCH_SIZE, LATENT_DIM], 0.0, 1.0, dtype=tf.float32)
-        #     latent_vec = latent_mean + tf.multiply(random_normal, latent_stddev)
-        # with tf.name_scope('reconstruct'):
-        latent_vec = tf.add(latent_mean, latent_stddev, name='latent_feature')
+        # todo 这里用laten_mean or add  ？？？待检测！！
+        latent_encoder = tf.add(latent_mean, latent_stddev, name='latent_feature')
+    with tf.name_scope('train'):
+        random_normal = tf.random_normal([BATCH_SIZE, LATENT_DIM], 0.0, 1.0, dtype=tf.float32)
+        latent_vec = latent_mean + tf.multiply(random_normal, latent_stddev)
 
     latent_sample = tf.placeholder(tf.float32, shape=[None, LATENT_DIM], name='latent_input')
 
@@ -581,30 +284,28 @@ def train():
             reconst_image = decoder(latent_vec, train_logical=False)
 
     with tf.name_scope('loss'):
-        kl_divergence = -0.5 * tf.reduce_sum(1 + 2 * latent_stddev - tf.square(latent_mean) - tf.exp(2 * latent_stddev))
+        kl_divergence = PARAMATER_KL_RATE * tf.reduce_sum(
+            1 + 2 * latent_stddev - tf.square(latent_mean) - tf.exp(2 * latent_stddev))
         reconstruction_loss = tf.reduce_sum(tf.square(y - x))
 
     with tf.name_scope('optimizer'):
         vae_loss = reconstruction_loss + kl_divergence
+        tf.summary.scalar('reconstruction_loss', reconstruction_loss)
+        tf.summary.scalar('loss', vae_loss)
         train_step = tf.train.AdamOptimizer(learning_rate=LEARNING_RATE).minimize(vae_loss, )
 
     """ prepare  data """
-
-    # train_total_data, train_size, _, _, test_data, test_labels = mnist_data.prepare_MNIST_data()
-
-    total_batch = int(n_samples / BATCH_SIZE)
-    min_tot_loss = 1e99
 
     # config = tf.ConfigProto(allow_soft_placement=True, log_device_placement=True)
     config = tf.ConfigProto()
     config.gpu_options.allow_growth = True
     with tf.Session(config=config) as sess:
+
+        merged = tf.summary.merge_all()
+        train_writer = tf.summary.FileWriter('./tmp/vae_train', sess.graph)
+
         # init the encoder of inception with pretrained weights
         sess.run(tf.global_variables_initializer())
-        # get_init_fn_inceptonv1(sess, './checkpoints/inception_v1.ckpt')
-        # get_init_fn_inceptonv4(sess, './checkpoints/inception_v4.ckpt')
-        # get_init_fn_incepton_resnetv2(sess, './checkpoints/inception_resnet_v2_2016_08_30.ckpt')
-        # get_init_fn_resnetv2_152(sess, './checkpoints/resnet_v2_152/resnet_v2_152.ckpt')
 
         saver = tf.train.Saver(max_to_keep=0)
         ckpt = tf.train.get_checkpoint_state(MODEL_PATH)
@@ -615,8 +316,12 @@ def train():
             g_step = int(os.path.basename(ckpt.model_checkpoint_path).split('-')[1])
         else:
             print 'train from basenet weights'
-            get_init_fn_resnetv2_101(sess, './checkpoints/resnet_v2_101/resnet_v2_101.ckpt')
-        # sess.run(tf.global_variables_initializer())
+            encoder_factory.get_init_fn_resnetv2_101(sess, './checkpoints/resnet_v2_101/resnet_v2_101.ckpt')
+            # encoder_factory.get_init_fn_inceptonv1(sess, './checkpoints/inception_v1.ckpt')
+            # encoder_factory.get_init_fn_inceptonv4(sess, './checkpoints/inception_v4.ckpt')
+            # encoder_factory.get_init_fn_incepton_resnetv2(sess, './checkpoints/inception_resnet_v2_2016_08_30.ckpt')
+            # encoder_factory.get_init_fn_resnetv2_152(sess, './checkpoints/resnet_v2_152/resnet_v2_152.ckpt')
+
         coord = tf.train.Coordinator()
         threads = tf.train.start_queue_runners(coord=coord, sess=sess)
 
@@ -627,40 +332,20 @@ def train():
             # lab_batch_r_f = lab_batch_r / 255.0
             # the image process has been done in image_reader.py
             img_batch_r_f = img_batch_r
-            lab_batch_r_f = lab_batch_r
+
             train_data_ = img_batch_r_f
+            lab_batch_r_f = lab_batch_r
             # Random shuffling
             # np.random.shuffle(train_data_)
 
             start_time = time.time()
-            make_dir(MODEL_PATH)
-            make_dir(SAMPLES_PATH)
-            # # 验证输入文件的正确性
-            # data = np.reshape((train_data_ * 255).astype(int), (20, 20, HEIGHT, WIDTH, DEPTH))
-            # data = np.concatenate(np.concatenate(data, 1), 1)
-            # cv2.imwrite(SAMPLES_PATH + '/iter-x-ori-%d.png' % i, data[:,:,::-1])
-            #
-            # data = np.reshape((lab_batch_r_f * 255).astype(int), (20, 20, HEIGHT, WIDTH, DEPTH))
-            # data = np.concatenate(np.concatenate(data, 1), 1)
-            # cv2.imwrite(SAMPLES_PATH + '/iter-x-label-%d.png' % i, data[:, :, ::-1])
 
-            _, loss = sess.run([train_step, vae_loss], feed_dict={x_input: train_data_, x: lab_batch_r_f})
+            # valid_the_input(i, lab_batch_r_f, train_data_,HEIGHT,WIDTH,DEPTH)
 
-            # Loop over all batches
-            # for j in range(total_batch):
-            #     # Compute the offset of the current minibatch in the data.
-            #     offset = (j * BATCH_SIZE) % (n_samples)
-            #     batch_xs_input = train_data_[offset:(offset + BATCH_SIZE), :]
-            #
-            #     # 验证输入文件的正确性
-            #     # data = np.reshape((batch_xs_input*255).astype(int), (20, 20, HEIGHT, WIDTH, DEPTH))
-            #     # data = np.concatenate(np.concatenate(data, 1), 1)
-            #     # cv2.imwrite(SAMPLES_PATH + '/iter-x-%d.png' % j, data)
-            #
-            #     # run_time = time.time()
-            #     _, loss = sess.run([train_step, vae_loss], feed_dict={x_input: batch_xs_input, x: batch_xs_input})
-            #     # run_end_time = time.time()
-            #     # print('run batch_%d ,time: %f' % (j, (run_end_time - run_time)))
+            _, summary, loss = sess.run([train_step, merged, vae_loss],
+                                        feed_dict={x_input: train_data_, x: lab_batch_r_f})
+            train_writer.add_summary(summary, i)
+
             end_time = time.time()
             print('iter: %d, loss: %f, time: %f' % (i, loss, end_time - start_time))
 
@@ -670,17 +355,35 @@ def train():
                 batch_xs_input = train_data_[offset:(offset + EVAL_ROWS * EVAL_COLS), :]
 
                 data = sess.run(y, feed_dict={x_input: batch_xs_input})
-                data = np.reshape((data * 255).astype(int), (EVAL_ROWS, EVAL_COLS, HEIGHT, WIDTH, DEPTH))
+
+                data = unpreprocess(data)
+
+                data = np.reshape(data.astype(int), (EVAL_ROWS, EVAL_COLS, HEIGHT, WIDTH, DEPTH))
                 data = np.concatenate(np.concatenate(data, 1), 1)
                 cv2.imwrite(SAMPLES_PATH + '/iter-recon-new-' + str(i) + '.png', data[:, :, ::-1])
             if (i + 1) % EVAL_INTERVAL == 0:
                 latent_random = np.random.normal(0.0, 1.0, size=[EVAL_ROWS * EVAL_COLS, LATENT_DIM]).astype(np.float32)
                 data = sess.run(gen_image, feed_dict={latent_sample: latent_random})
-                data = np.reshape((data * 255).astype(int), (EVAL_ROWS, EVAL_COLS, HEIGHT, WIDTH, DEPTH))
+                data = unpreprocess(data)
+                data = np.reshape(data.astype(int), (EVAL_ROWS, EVAL_COLS, HEIGHT, WIDTH, DEPTH))
                 data = np.concatenate(np.concatenate(data, 1), 1)
                 cv2.imwrite(SAMPLES_PATH + '/iter-genera-' + str(i) + '.png', data[:, :, ::-1])
 
-        saver.save(sess, MODEL_PATH + '/vae', global_step=i + 1)
+        saver.save(sess, MODEL_PATH + '/vae', global_step=TRAIN_ITERS)
+        train_writer.close()
+
+
+def unpreprocess(data, basenet='vgg'):
+    # todo 处理不同basenet情况下,重建或者恢复的图像乱问题。
+    if 'vgg' in basenet:
+        means = [123.68, 116.779, 103.939]
+        data[..., 0] += means[0]
+        data[..., 1] += means[1]
+        data[..., 2] += means[2]
+    else:
+        data = None
+        raise Exception
+    return data
 
 
 if __name__ == "__main__":

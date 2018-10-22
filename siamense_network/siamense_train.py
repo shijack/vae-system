@@ -6,7 +6,7 @@ import os
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
-from image_reader import ImageReader
+from preprocessing.image_reader import ImageReader
 from siamense_model import *
 import numpy as np
 
@@ -84,7 +84,7 @@ with tf.Session() as sess:
 
         img_name_batch_r, img_batch_r, lab_batch_r = sess.run([img_name_batch, img_batch, label_batch])
 
-        b_l = img_batch_r
+        b_l = img_batch_r / 255.
 
         tmp_a = lab_batch_r[:lab_batch_r.shape[0] / 2 + 1, ...]
         tmp_b = lab_batch_r[lab_batch_r.shape[0] - lab_batch_r.shape[0] / 2:, ...]
@@ -106,7 +106,7 @@ with tf.Session() as sess:
         print tmp_index
         tmp_b = tmp_b[tmp_index]
 
-        b_r = np.concatenate((tmp_a, tmp_b), axis=0)
+        b_r = np.concatenate((tmp_a, tmp_b), axis=0) / 255.
 
         _, l, summary_str = sess.run([train_step, loss, merged],
                                      feed_dict={left: b_l, right: b_r, label: b_sim})

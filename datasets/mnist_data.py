@@ -8,14 +8,11 @@ import gzip
 import os
 
 import numpy
+import tensorflow as tf
 from scipy import ndimage
-
 from six.moves import urllib
 
-import tensorflow as tf
-
-SOURCE_URL = 'http://yann.lecun.com/exdb/mnist/'
-DATA_DIRECTORY = "/data/datasets/mnist/"
+SOURCE_URL_MNIST = 'http://yann.lecun.com/exdb/mnist/'
 
 # Params for MNIST
 IMAGE_SIZE = 28
@@ -26,13 +23,13 @@ VALIDATION_SIZE = 5000  # Size of the validation set.
 
 
 # Download MNIST data
-def maybe_download(filename):
+def maybe_download(dataset_dir, filename):
     """Download the data from Yann's website, unless it's already here."""
-    if not tf.gfile.Exists(DATA_DIRECTORY):
-        tf.gfile.MakeDirs(DATA_DIRECTORY)
-    filepath = os.path.join(DATA_DIRECTORY, filename)
+    if not tf.gfile.Exists(dataset_dir):
+        tf.gfile.MakeDirs(dataset_dir)
+    filepath = os.path.join(dataset_dir, filename)
     if not tf.gfile.Exists(filepath):
-        filepath, _ = urllib.request.urlretrieve(SOURCE_URL + filename, filepath)
+        filepath, _ = urllib.request.urlretrieve(SOURCE_URL_MNIST + filename, filepath)
         with tf.gfile.GFile(filepath) as f:
             size = f.size()
         print('Successfully downloaded', filename, size, 'bytes.')
@@ -115,12 +112,12 @@ def expend_training_data(images, labels):
 
 
 # Prepare MNISt data
-def prepare_MNIST_data(use_norm_shift=False, use_norm_scale=True, use_data_augmentation=False):
+def prepare_MNIST_data(dataset_dir, use_norm_shift=False, use_norm_scale=True, use_data_augmentation=False):
     # Get the data.
-    train_data_filename = maybe_download('train-images-idx3-ubyte.gz')
-    train_labels_filename = maybe_download('train-labels-idx1-ubyte.gz')
-    test_data_filename = maybe_download('t10k-images-idx3-ubyte.gz')
-    test_labels_filename = maybe_download('t10k-labels-idx1-ubyte.gz')
+    train_data_filename = maybe_download(dataset_dir, 'train-images-idx3-ubyte.gz')
+    train_labels_filename = maybe_download(dataset_dir, 'train-labels-idx1-ubyte.gz')
+    test_data_filename = maybe_download(dataset_dir, 't10k-images-idx3-ubyte.gz')
+    test_labels_filename = maybe_download(dataset_dir, 't10k-labels-idx1-ubyte.gz')
 
     # Extract it into numpy arrays.
     train_data = extract_data(train_data_filename, 60000, use_norm_shift, use_norm_scale)
@@ -143,3 +140,7 @@ def prepare_MNIST_data(use_norm_shift=False, use_norm_scale=True, use_data_augme
     train_size = train_total_data.shape[0]
 
     return train_total_data, train_size, validation_data, validation_labels, test_data, test_labels
+
+
+if __name__ == '__main__':
+    train_total_data, train_size, _, _, test_data, test_labels = prepare_MNIST_data('./datasets/data')

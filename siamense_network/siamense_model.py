@@ -1,7 +1,7 @@
 # coding=utf-8
 import tensorflow as tf
 
-import vgg16
+from siamense_network import vgg16
 
 flags = tf.app.flags
 FLAGS = flags.FLAGS

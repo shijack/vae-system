@@ -71,6 +71,11 @@ def load_image2(path, height=None, width=None):
     return skimage.transform.resize(img, (ny, nx))
 
 
+def make_dir(directory):
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+
+
 def test():
     img = skimage.io.imread("./test_data/starry_night.jpg")
     ny = 300

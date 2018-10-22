@@ -1,14 +1,19 @@
+# coding=utf-8
 import inspect
+import os
 import time
 
 import numpy as np
-import os
 import tensorflow as tf
 
 VGG_MEAN = [103.939, 116.779, 123.68]
 
 
 class Vgg16:
+    '''
+    this vgg16 版本所有变量都是不可以训练的！如果需要能够训练的版本，请移步。
+    '''
+
     def __init__(self, vgg16_npy_path=None):
         if vgg16_npy_path is None:
             path = inspect.getfile(Vgg16)

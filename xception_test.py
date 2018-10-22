@@ -1,9 +1,9 @@
 # Note that this may take several minutes.
 
 import os
-
-os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+#
+# os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import tensorflow as tf
 
@@ -34,8 +34,6 @@ def get_init_fn_inceptonv1(checkpoints_dir):
         os.path.join(checkpoints_dir, 'inception_v1.ckpt'),
         variables_to_restore)
 
-
-train_dir = '/Users/shijack/Desktop/ML/tmp/inception_finetuned/'
 
 
 def load_batch(dataset, batch_size=32, height=299, width=299, is_training=False):
@@ -79,7 +77,8 @@ def load_batch(dataset, batch_size=32, height=299, width=299, is_training=False)
 from datasets import dataset_utils
 
 # url = "http://download.tensorflow.org/data/flowers.tar.gz"
-flowers_data_dir = '/data/datasets/tmp/flowers'
+flowers_data_dir = '/Users/shijack/Desktop/tmp/flowers'
+train_dir = './tmp/inception_finetuned/'
 #
 # if not tf.gfile.Exists(flowers_data_dir):
 #     tf.gfile.MakeDirs(flowers_data_dir)

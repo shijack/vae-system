@@ -19,7 +19,7 @@ import random
 
 import tensorflow as tf
 
-from image_reader import ImageReader
+from preprocessing.image_reader import ImageReader
 from utils.utils import get_all_files
 
 
