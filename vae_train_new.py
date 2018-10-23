@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 import tensorflow as tf
 
-import nets.encoder_factory as encoder_factory
+import nets.encoder_factory
 from preprocessing.image_reader import ImageReader
 from utils.utils import make_dir
 
@@ -21,8 +21,8 @@ HEIGHT, WIDTH, DEPTH = 224, 224, 3
 H1, W1, D1, D2, D3, D4 = 14, 14, 16, 32, 64, 128
 
 BATCH_SIZE, LEARNING_RATE, TRAIN_ITERS = 32, 1e-4, 1000000
-EVAL_ROWS, EVAL_COLS, SAMPLES_PATH, EVAL_INTERVAL = 4, 4, './samples_vae_resnetv2_101', 1000
-MODEL_PATH, SAVE_INTERVAL = './model_vae_resnetv2_101', 1000
+EVAL_ROWS, EVAL_COLS, SAMPLES_PATH, EVAL_INTERVAL = 4, 4, './samples_vae_resnetv2_101', 500
+MODEL_PATH, SAVE_INTERVAL = './model_vae_resnetv2_101', 500
 
 IS_SCALE = True
 IS_MIRROR = True
@@ -35,12 +35,19 @@ PARAMATER_KL_RATE = -0.5
 
 def valid_the_input(i, lab_batch_r_f, train_data_, input_h, input_w, input_c):
     # 验证输入文件的正确性
-    data = np.reshape((train_data_ * 255).astype(int), (20, 20, input_h, input_w, input_c))
+    offset = 0
+    batch_xs_input = train_data_[offset:(offset + EVAL_ROWS * EVAL_COLS), :]
+    batch_xs_label = lab_batch_r_f[offset:(offset + EVAL_ROWS * EVAL_COLS), :]
+    train_data_ = unpreprocess(batch_xs_input)
+    lab_batch_r_f = unpreprocess(batch_xs_label)
+
+    data = np.reshape(train_data_.astype(int), (EVAL_ROWS, EVAL_COLS, input_h, input_w, input_c))
     data = np.concatenate(np.concatenate(data, 1), 1)
-    cv2.imwrite(SAMPLES_PATH + '/iter-x-ori-%d.png' % i, data[:, :, ::-1])
-    data = np.reshape((lab_batch_r_f * 255).astype(int), (20, 20, input_h, input_w, input_c))
+    cv2.imwrite(SAMPLES_PATH + '/iter-input-train-%d.png' % i, data[:, :, ::-1])
+
+    data = np.reshape(lab_batch_r_f.astype(int), (EVAL_ROWS, EVAL_COLS, input_h, input_w, input_c))
     data = np.concatenate(np.concatenate(data, 1), 1)
-    cv2.imwrite(SAMPLES_PATH + '/iter-x-label-%d.png' % i, data[:, :, ::-1])
+    cv2.imwrite(SAMPLES_PATH + '/iter-inut-labl-%d.png' % i, data[:, :, ::-1])
 
 
 def assign_decay(orig_val, new_val, momentum, name):
@@ -132,6 +139,7 @@ def variable_summaries(var, name):
         tf.summary.scalar('max/' + name, tf.reduce_max(var))
         tf.summary.scalar('min/' + name, tf.reduce_min(var))
         tf.summary.histogram(name, var)
+
 
 # -------------------------------------------------------------
 # -------------------------- decoder --------------------------
@@ -227,7 +235,7 @@ def train():
     make_dir(SAMPLES_PATH)
 
     with tf.name_scope('batch'):
-        train_imgs_file = './data/image_list_train.txt'
+        train_imgs_file = './data_trans_imgs_centos/image_list_train.txt'
         print 'the train imags txt is : ' + train_imgs_file
         img_name_batch, img_batch, label_batch, n_samples = read_images_queue(train_imgs_file, BATCH_SIZE,
                                                                               image_channels=DEPTH,
@@ -243,27 +251,27 @@ def train():
         x_input = tf.placeholder(tf.float32, shape=[None, HEIGHT, WIDTH, DEPTH], name='input_img')
         x = tf.placeholder(tf.float32, shape=[None, HEIGHT, WIDTH, DEPTH], name='target_img')
 
-        # latent_mean, latent_stddev = encoder_factory.encoder(x_input, True, LATENT_DIM, D1, D2, D3, D4)
+        # latent_mean, latent_stddev = nets.encoder_factory.encoder(x_input, True, LATENT_DIM, D1, D2, D3, D4)
     # latent_mean, latent_stddev = encoder_vgg16(x_input, latent_dim=LATENT_DIM)
     # latent_mean, latent_stddev = encoder_vgg19(x_input, latent_dim=LATENT_DIM)
     # latent_mean, latent_stddev = encoder_inceptionv1(x_input, latent_dim=LATENT_DIM)
     # latent_mean, latent_stddev = encoder_inceptionv4(x_input, latent_dim=LATENT_DIM)
     # latent_mean, latent_stddev = encoder_inception_resnetv2(x_input, latent_dim=LATENT_DIM)
     # latent_mean, latent_stddev = encoder_resnetv2_152(x_input, latent_dim=LATENT_DIM)#参数过多，训练很慢
-    latent_mean, latent_stddev = encoder_factory.encoder_resnetv2_101(x_input, latent_dim=LATENT_DIM)
+    latent_mean, latent_stddev = nets.encoder_factory.encoder_resnetv2_101(x_input, latent_dim=LATENT_DIM)
 
     # add input 10 images to the tensorboard
-    # with tf.name_scope('input_reshape'):
-    #     means = [123.68, 116.779, 103.939]
-    #     num_channels = x_input.get_shape().as_list()[-1]
-    #     if len(means) != num_channels:
-    #         raise ValueError('len(means) must match the number of channels')
-    #
-    #     channels = tf.split(axis=3, num_or_size_splits=num_channels, value=x_input)
-    #     for i in range(num_channels):
-    #         channels[i] += means[i]
-    #     image_shaped_input = tf.concat(axis=3, values=channels)
-    #     tf.summary.image('input', image_shaped_input, 10)
+    with tf.name_scope('input_reshape'):
+        means = [123.68, 116.779, 103.939]
+        num_channels = x_input.get_shape().as_list()[-1]
+        if len(means) != num_channels:
+            raise ValueError('len(means) must match the number of channels')
+
+        channels = tf.split(axis=3, num_or_size_splits=num_channels, value=x_input)
+        for i in range(num_channels):
+            channels[i] += means[i]
+        image_shaped_input = tf.concat(axis=3, values=channels)
+        tf.summary.image('input', image_shaped_input, 10)
 
     with tf.variable_scope('variance'):
         # todo 这里用laten_mean or add  ？？？待检测！！
@@ -280,8 +288,9 @@ def train():
         scope.reuse_variables()
         with tf.name_scope('generate'):
             gen_image = decoder(latent_sample, train_logical=False)
+        scope.reuse_variables()
         with tf.name_scope('reconstruct'):
-            reconst_image = decoder(latent_vec, train_logical=False)
+            reconst_image = decoder(latent_encoder, train_logical=False)
 
     with tf.name_scope('loss'):
         kl_divergence = PARAMATER_KL_RATE * tf.reduce_sum(
@@ -316,7 +325,7 @@ def train():
             g_step = int(os.path.basename(ckpt.model_checkpoint_path).split('-')[1])
         else:
             print 'train from basenet weights'
-            encoder_factory.get_init_fn_resnetv2_101(sess, './checkpoints/resnet_v2_101/resnet_v2_101.ckpt')
+            nets.encoder_factory.get_init_fn_resnetv2_101(sess, './checkpoints/resnet_v2_101/resnet_v2_101.ckpt')
             # encoder_factory.get_init_fn_inceptonv1(sess, './checkpoints/inception_v1.ckpt')
             # encoder_factory.get_init_fn_inceptonv4(sess, './checkpoints/inception_v4.ckpt')
             # encoder_factory.get_init_fn_incepton_resnetv2(sess, './checkpoints/inception_resnet_v2_2016_08_30.ckpt')
@@ -340,7 +349,8 @@ def train():
 
             start_time = time.time()
 
-            # valid_the_input(i, lab_batch_r_f, train_data_,HEIGHT,WIDTH,DEPTH)
+            if (i + 1) % SAVE_INTERVAL == 0:
+                valid_the_input(i, lab_batch_r_f, train_data_, HEIGHT, WIDTH, DEPTH)
 
             _, summary, loss = sess.run([train_step, merged, vae_loss],
                                         feed_dict={x_input: train_data_, x: lab_batch_r_f})
@@ -354,17 +364,21 @@ def train():
                 offset = 0
                 batch_xs_input = train_data_[offset:(offset + EVAL_ROWS * EVAL_COLS), :]
 
-                data = sess.run(y, feed_dict={x_input: batch_xs_input})
+                data = sess.run(reconst_image, feed_dict={x_input: batch_xs_input})
 
                 data = unpreprocess(data)
 
                 data = np.reshape(data.astype(int), (EVAL_ROWS, EVAL_COLS, HEIGHT, WIDTH, DEPTH))
                 data = np.concatenate(np.concatenate(data, 1), 1)
                 cv2.imwrite(SAMPLES_PATH + '/iter-recon-new-' + str(i) + '.png', data[:, :, ::-1])
+
             if (i + 1) % EVAL_INTERVAL == 0:
                 latent_random = np.random.normal(0.0, 1.0, size=[EVAL_ROWS * EVAL_COLS, LATENT_DIM]).astype(np.float32)
                 data = sess.run(gen_image, feed_dict={latent_sample: latent_random})
+
                 data = unpreprocess(data)
+                # data = data * 255.
+
                 data = np.reshape(data.astype(int), (EVAL_ROWS, EVAL_COLS, HEIGHT, WIDTH, DEPTH))
                 data = np.concatenate(np.concatenate(data, 1), 1)
                 cv2.imwrite(SAMPLES_PATH + '/iter-genera-' + str(i) + '.png', data[:, :, ::-1])
@@ -375,7 +389,7 @@ def train():
 
 def unpreprocess(data, basenet='vgg'):
     # todo 处理不同basenet情况下,重建或者恢复的图像乱问题。
-    if 'vgg' in basenet:
+    if 'vgg' or 'resnet' in basenet:
         means = [123.68, 116.779, 103.939]
         data[..., 0] += means[0]
         data[..., 1] += means[1]

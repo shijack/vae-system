@@ -1,5 +1,7 @@
 # coding=utf-8
 import os
+import shutil
+
 import skimage
 import skimage.io
 import skimage.transform
@@ -82,3 +84,34 @@ def test():
     nx = img.shape[1] * ny / img.shape[0]
     img = skimage.transform.resize(img, (ny, nx))
     skimage.io.imsave("./test_data/test/output.jpg", img)
+
+
+def copy_size_max(dirname, targetDir):
+    subdir_list = os.listdir(dirname)
+    video_max = []
+    for sub_dirname in subdir_list:
+        allsize = []
+        for (curDir, subDir, fileHere) in os.walk(os.path.join(dirname, sub_dirname)):
+            print(curDir)
+            for filename in fileHere:
+                fullname = os.path.join(curDir, filename)
+                filesize = os.path.getsize(fullname)
+                allsize.append((filesize, fullname))
+
+        allsize.sort(key=lambda x: x[0])
+        print(allsize[-1])
+        video_max.append(allsize[-1])
+    print video_max
+
+    if not os.path.exists(targetDir):
+        os.makedirs(targetDir)
+    for eachfile in video_max:
+        eachfile = eachfile[1]
+        if not os.path.exists(eachfile):
+            print "src path not exist:" + eachfile
+        shutil.copy(eachfile, os.path.join(targetDir, os.path.basename(eachfile)))
+        print eachfile + " copy succeeded!"
+
+
+if __name__ == '__main__':
+    copy_size_max('/home/shihuijie/Desktop/ml/tmp/vcdb/core_dataset', '/home/shihuijie/Desktop/video_vcdb_to_train')
