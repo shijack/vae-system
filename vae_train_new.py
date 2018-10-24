@@ -247,18 +247,22 @@ def train():
                                                                               is_shuffle=IS_SHUFFLE,
                                                                               basenet='resnetv2_101')
 
-    with tf.variable_scope('encoder'):
+    with tf.variable_scope('encoder') as scope:
         x_input = tf.placeholder(tf.float32, shape=[None, HEIGHT, WIDTH, DEPTH], name='input_img')
         x = tf.placeholder(tf.float32, shape=[None, HEIGHT, WIDTH, DEPTH], name='target_img')
-
-        # latent_mean, latent_stddev = nets.encoder_factory.encoder(x_input, True, LATENT_DIM, D1, D2, D3, D4)
+        with tf.name_scope('train'):
+            latent_mean, latent_stddev = nets.encoder_factory.encoder(x_input, True, LATENT_DIM, D1, D2, D3, D4)
+        scope.reuse_variables()
+        with tf.name_scope('eval'):
+            latent_mean_eval, latent_stddev_eval = nets.encoder_factory.encoder(x_input, False, LATENT_DIM, D1, D2, D3,
+                                                                                D4)
     # latent_mean, latent_stddev = encoder_vgg16(x_input, latent_dim=LATENT_DIM)
     # latent_mean, latent_stddev = encoder_vgg19(x_input, latent_dim=LATENT_DIM)
     # latent_mean, latent_stddev = encoder_inceptionv1(x_input, latent_dim=LATENT_DIM)
     # latent_mean, latent_stddev = encoder_inceptionv4(x_input, latent_dim=LATENT_DIM)
     # latent_mean, latent_stddev = encoder_inception_resnetv2(x_input, latent_dim=LATENT_DIM)
     # latent_mean, latent_stddev = encoder_resnetv2_152(x_input, latent_dim=LATENT_DIM)#参数过多，训练很慢
-    latent_mean, latent_stddev = nets.encoder_factory.encoder_resnetv2_101(x_input, latent_dim=LATENT_DIM)
+    # latent_mean, latent_stddev = nets.encoder_factory.encoder_resnetv2_101(x_input, latent_dim=LATENT_DIM)
 
     # add input 10 images to the tensorboard
     with tf.name_scope('input_reshape'):
@@ -275,7 +279,8 @@ def train():
 
     with tf.variable_scope('variance'):
         # todo 这里用laten_mean or add  ？？？待检测！！
-        latent_encoder = tf.add(latent_mean, latent_stddev, name='latent_feature')
+        # latent_encoder只在图像重建和生成特征中使用。
+        latent_encoder = tf.add(latent_mean_eval, latent_stddev_eval, name='latent_feature')
     with tf.name_scope('train'):
         random_normal = tf.random_normal([BATCH_SIZE, LATENT_DIM], 0.0, 1.0, dtype=tf.float32)
         latent_vec = latent_mean + tf.multiply(random_normal, latent_stddev)
@@ -301,7 +306,13 @@ def train():
         vae_loss = reconstruction_loss + kl_divergence
         tf.summary.scalar('reconstruction_loss', reconstruction_loss)
         tf.summary.scalar('loss', vae_loss)
-        train_step = tf.train.AdamOptimizer(learning_rate=LEARNING_RATE).minimize(vae_loss, )
+
+        # todo 获取可训练的var_list
+        g_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='generator')
+        d_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='discriminator')
+        var_list_train = g_vars + d_vars
+
+        train_step = tf.train.AdamOptimizer(learning_rate=LEARNING_RATE).minimize(vae_loss, var_list_train=None)
 
     """ prepare  data """
 
